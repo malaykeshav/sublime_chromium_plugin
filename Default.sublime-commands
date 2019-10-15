@@ -1,3 +1,5 @@
 [
     { "caption": "Chromium: Select Platform", "command": "chromium" },
+    { "caption": "Chromium: Show output panel", "command": "show_panel", "args": {"panel": "output.chromium_panel"}},
+    { "caption": "Chromium: Repeat previous operation", "command": "chromium", "args": {"operation": 7}}
 ]

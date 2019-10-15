@@ -1,8 +1,6 @@
-import sublime
-import sublime_plugin
-
 import select
 import subprocess
+import time
 import threading
 import os
 
@@ -19,6 +17,64 @@ class Operation:
   DEPLOY = 3
   BUILD_AND_RUN = 4
   BUILD_AND_DEPLOY = 5
+  SHOW_OUTPUT_PANEL = 6
+  REPEAT_PREVIOUS_OPERATION = 7
+
+class BuildTargets:
+  # Release targets
+  CHROME = 0
+  CHROME_SANDBOX = 1
+  CHROME_PUBLIC_APK = 2
+  WEBUI_CLOSURE_COMPILE = 3
+
+  # Test targets
+  APP_LIST_UNITTEST = 4
+  ASH_UNITTESTS = 5
+  AURA_UNITTESTS = 6
+  BROWSERTESTS = 7
+  COMPOSITOR_UNITTESTS = 8
+  CONTENT_BROWSERTESTS = 9
+  CONTENT_UNITTESTS = 10
+  CC_UNITTESTS = 11
+  DISPLAY_UNITTESTS = 12
+  GFX_UNITTESTS = 13
+  INTERACTIVE_UI_TESTS = 14
+  UNITTESTS = 15
+  VIEWS_UNITTESTS = 16
+  VIZ_UNITTESTS = 17
+  WEBKIT_UNITTESTS = 18
+  WM_UNITTESTS = 19
+
+TARGETS = [
+  'chrome',
+  'chrome_sandbox',
+  'chrome_public_apk',
+  'webui_closure_compile',
+  'app_list_unittests',
+  'ash_unittests',
+  'aura_unittests',
+  'browser_tests',
+  'compositor_unittests',
+  'content_browsertests',
+  'content_unittests',
+  'cc_unittests',
+  'display_unittests',
+  'gfx_unittests',
+  'interactive_ui_tests',
+  'unit_tests',
+  'views_unittests',
+  'viz_unittests',
+  'webkit_unit_tests',
+  'wm_unittests',
+]
+
+# Default targets for each platform
+DEFAULT_OS_TARGETS = [
+  [BuildTargets.CHROME_PUBLIC_APK],  # android
+  [BuildTargets.CHROME],             # chrome os
+  [BuildTargets.CHROME, BuildTargets.CHROME_SANDBOX], # chrome os device
+  [BuildTargets.CHROME],             # linux
+]
 
 GN_ARGS_FILE_NAME = "args.gn"
 
@@ -27,12 +83,18 @@ BASH_INTERFACE = None
 
 LINE_REGEX = r'(?:^|[)] )[.\\\\/]*([a-z]?:?[\\w.\\\\/]+)[(:]([0-9]+)[,:]?([0-9]+)?[)]?:?(.*)$'
 
+STREAM_END_TOKEN = 'SUBLIME_STREAM_END'
+
 # Settings key:
 GN_ARGS_FILE_KEY = 'GN_ARGS_FILE_KEY'
 GN_ARGS_OUT_DIR_KEY = 'GN_ARGS_OUT_DIR_KEY'
 
+# Popen object for the current build process.
+BUILD_PROCESS = None
+
 class BashInterface:
   output_panel = None
+  stdin_lock = threading.Lock()
   def Get():
     global BASH_INTERFACE
     if BASH_INTERFACE is None:
@@ -46,8 +108,9 @@ class BashInterface:
     print (self.__GetResult())
 
   def __RunCmd(self, cmd):
-    self.BASH.stdin.write(bytes(cmd, 'UTF-8'))
-    self.BASH.stdin.flush()
+    with self.stdin_lock:
+      self.BASH.stdin.write(bytes(cmd, 'UTF-8'))
+      self.BASH.stdin.flush()
 
   def __GetResult(self, timeout=0.5):
     result = ""
@@ -59,23 +122,49 @@ class BashInterface:
 
     return result
 
-  def __StreamResult(self, timeout=0.5):
-    threading.Thread(
-        target=self.__StreamResultTarget,
-        args=(self.BASH.stdout, timeout, self.output_panel)).start()
+  def __StreamResult(self, file=None, timeout=0.5, end_token=None):
+    if file:
+      threading.Thread(
+          target=self.__StreamFileContent,
+          args=(file, self.output_panel, end_token)).start()
+    else:
+      threading.Thread(
+          target=self.__StreamResultTarget,
+          args=(self.BASH.stdout, timeout, self.output_panel)).start()
 
 
   def __StreamResultTarget(self, stdout, timeout, output_panel):
+    source = stdout.fileno()
+
     result = ""
-    r, w, e = select.select([stdout], [], [], timeout)
-    while self.BASH.stdout in r:
-      result += os.read(stdout.fileno(), 2**8).decode("utf-8")
-      r, w, e = select.select([stdout], [], [], 0.5)
+    data = ""
+
+    r, w, e = select.select([source], [], [], timeout)
+    while source in r:
+      data = os.read(source, 2**8).decode("utf-8")
+      result += data
+      r, w, e = select.select([source], [], [], timeout)
+    
+    if len(result) == 0:
+      result = "No output generated"
+
     if output_panel:
       output_panel.Print(result)
-      print (result)
     else:
       print (result)
+
+
+  def __StreamFileContent(self, filename, output_panel, end_token):
+    with open(filename, 'r') as file:
+      current_line = ""
+      while end_token not in current_line:
+        current_line = file.readline()
+        if len(current_line) > 0:
+          if output_panel:
+            output_panel.Print(current_line.rstrip())
+          else:
+            print (current_line)
+
 
   def __RunCmdAndGetResult(self, cmd):
     self.__RunCmd(cmd)
@@ -92,38 +181,115 @@ class BashInterface:
   def MaybeCreateFile(self, path, name):
     self.__RunCmd("touch " + path + name + "\n")
 
+  def CreateFile(self, file_path):
+    with open(file_path, "w+") as file:
+      file.write("")
+
   def CreateDirectory(self, path):
     self.__RunCmd("mkdir -p " + path)
 
   def GenerateGnArgs(self, path):
     print ("Will run: " + "gn gen \'" + path + "\'\n")
     self.__RunCmd("gn gen \'" + path + "\'\n")
-    self.output_panel.Print("gn gen \'" + path)
-    self.__StreamResult(10)
+    self.output_panel.Print("gn gen \'" + path + "\'")
+    self.__StreamResult(timeout=10)
 
   def GoToDirectory(self, path):
     self.__RunCmd("cd " + path + "\n")
-    self.__StreamResult(1)
+    self.__StreamResult(timeout=1)
 
   def SetOutputPanel(self, output_panel):
     self.output_panel = output_panel
 
+  def TerminateBuild(self):
+    global BUILD_PROCESS
+
+    if not BUILD_PROCESS:
+      return
+
+    # Stop any previous build process if they are still running.
+    if BUILD_PROCESS.poll():
+      BUILD_PROCESS.terminate()
+
+  def Build(self, build_settings):
+    build_output_filename = "/build_output.txt"
+    build_output_file_path = build_settings.build_dir + build_output_filename
+
+    # Reset the output file and start reading from it.
+    self.CreateFile(build_output_file_path)
+    self.__StreamResult(file=build_output_file_path, timeout=30, 
+                        end_token=STREAM_END_TOKEN)
+
+    target_str = " ".join(build_settings.targets)
+
+    cmd =  ['cd', build_settings.project_path, ';']
+    cmd += ['ninja', '-j4096', '-C', build_settings.build_dir, target_str]
+    cmd += ['>', build_output_file_path]
+    cmd += [';', 'echo', STREAM_END_TOKEN, '>>', build_output_file_path]
+    build_cmd = " ".join(cmd)
+
+    global BUILD_PROCESS
+
+    self.TerminateBuild()
+
+    # Execute the command to build on a separate process that logs output into a file.
+    BUILD_PROCESS = subprocess.Popen(build_cmd, shell=True)
+
+    self.output_panel.Print("Build Process ID: " + str(BUILD_PROCESS.pid))
+
+class BuildSettings:
+  project_path = None
+  platform_str = None
+  build_dir = None
+  targets = []
+
+  def __init__(self, window, args):
+    self.project_path = window.extract_variables()['folder']
+
+    if "device" not in args:
+      args["device"] = ""
+
+    platform = args['platform']
+
+    self.platform_str = ['android', 'cros', args["device"], 'linux'][platform]
+    self.build_dir = (self.project_path + '/out_' +
+                     self.platform_str + '/Default/')
+
+    self.targets = []
+    for target in DEFAULT_OS_TARGETS[platform]:
+      self.targets.append(TARGETS[target])
+
+  def __eq__(self, obj):
+    return (isinstance(obj, BuildSettings) and
+            self.project_path == obj.project_path and
+            self.platform_str == obj.platform_str and
+            self.build_dir == obj.build_dir)
+
+  def __ne__(self, obj):
+    return not self == obj
+
+
 class ChromiumOutputPanel:
   panel = None
   panel_lock = threading.Lock()
+  window = None
 
   def __init__(self, window):
     with self.panel_lock:
-      self.panel = window.create_output_panel('exec')
+      self.window = window
+      self.panel = window.create_output_panel('chromium_panel')
       settings = self.panel.settings()
       settings.set('result_line_regex', LINE_REGEX)
 
       settings.set('result_base_dir', "some/dir/i/set")
-      window.run_command('show_panel', {'panel': 'output.exec'})
+      self.Show()
 
   def Print(self, msg):
     with self.panel_lock:
       self.panel.run_command('append', {'characters': msg + "\n"})
+
+  def Show(self):
+    self.window.run_command('show_panel', {'panel': 'output.chromium_panel'})
 
 
 class DeviceInputHandler(sublime_plugin.TextInputHandler):
@@ -240,15 +406,15 @@ class GnArgViewListener(sublime_plugin.ViewEventListener):
       BashInterface.Get().MaybeCreateFile(self.out_dir, GN_ARGS_FILE_NAME)
 
     BashInterface.Get().GenerateGnArgs(self.out_dir)
-    print ("Now generate gn args")
 
 
 
 class ChromiumCommand(sublime_plugin.WindowCommand):
   panel = None
   platform_input = None
-  previous_config = None
+  previous_args = None
   output_panel = None
+  is_repeat = False
 
   def __init__(self, *args):
     super(ChromiumCommand, self).__init__(*args)
@@ -262,50 +428,73 @@ class ChromiumCommand(sublime_plugin.WindowCommand):
 
   def run(self, **args):
     print (args)
-    self.output_panel = ChromiumOutputPanel(self.window)
+    if not self.output_panel:
+      self.output_panel = ChromiumOutputPanel(self.window)
+
+    if args['operation'] in [Operation.SHOW_OUTPUT_PANEL]:
+      self.output_panel.Show()
+      return
+
+    if args['operation'] in [Operation.REPEAT_PREVIOUS_OPERATION]:
+      if self.previous_args:
+        args = self.previous_args
+      else:
+        self.output_panel.Print("No previous operation available.")
+    else:
+      self.previous_args = args
+
     BashInterface.Get().SetOutputPanel(self.output_panel)
 
-    if args['operation'] == Operation.GENERATE_GN_ARGS:
-      self.GenerateGnArgs(args)
-      return
-    if previous_config == args:
-      self.Build(args)
-      return
-    previous_config = args
+    build_settings = BuildSettings(self.window, args)
 
-    # self.panel = self.window.create_output_panel("exec")
-    # self.window.run_command("show_panel", {"panel": "output.exec"})
-    # self.panel.run_command("append", {"characters": "Hello. Now Building. Okay"})
-    return
+    if args['operation'] == Operation.GENERATE_GN_ARGS:
+      self.GenerateGnArgs(build_settings)
+      return
+
+
+    if args['operation'] in [Operation.BUILD,
+                             Operation.BUILD_AND_RUN,
+                             Operation.BUILD_AND_DEPLOY]:
+      self.Build(build_settings)
+    if args['operation'] in [Operation.RUN, Operation.BUILD_AND_RUN]:
+      self.Run(build_settings)
+    if args['operation'] in [Operation.DEPLOY, Operation.BUILD_AND_DEPLOY]:
+      self.Deploy(build_settings)
 
   def description(self):
     return 'Build, compile or run chrome.'
 
   def input(self, args):
+    # All the input is already present if this is a repeat operation.
+    if 'operation' in args and args['operation'] in [Operation.REPEAT_PREVIOUS_OPERATION]:
+      return None
     return PlatformOptionInputHandler()
 
-  def GenerateGnArgs(self, args):
-    self.output_panel.Print("Generating GN Args")
-    project_path = self.window.extract_variables()['folder']
-    self.output_panel.Print("Project path: " + project_path)
-    platform = args['platform']
+  def GenerateGnArgs(self, build_settings):
+    self.Print("Generating GN Args")
+    self.Print("Project path: " + build_settings.project_path)
+    self.Print("out directory: " + build_settings.build_dir)
 
-    if "device" not in args:
-      args["device"] = ""
-
-    platform_token = ['android', 'cros', args["device"], 'linux'][platform]
-    out_dir = project_path + '/out_' + platform_token + '/Default/'
-    self.output_panel.Print("out directory: " + out_dir)
-
-    source_gn_dir = project_path + "/"
-    source_gn_file = platform_token + '.gn'
+    source_gn_dir = build_settings.project_path + "/../"
+    source_gn_file = build_settings.platform_str + '.gn'
 
     BashInterface.Get().MaybeCreateFile(source_gn_dir, source_gn_file)
 
     gn_view = self.window.open_file(
          source_gn_dir + source_gn_file, sublime.TRANSIENT)
     gn_view.settings().set(GN_ARGS_FILE_KEY, True)
-    gn_view.settings().set(GN_ARGS_OUT_DIR_KEY, out_dir)
+    gn_view.settings().set(GN_ARGS_OUT_DIR_KEY, build_settings.build_dir)
+
+  def Build(self, build_settings):
+    self.Print("Build chrome for " + build_settings.platform_str)
+    self.Print("Targets: " + (",".join(build_settings.targets)))
+    BashInterface.Get().Build(build_settings)
+
+  def Run(self, build_settings):
+    self.Print("Executing chrome for " + build_settings.platform_str)
+
+  def Print(self, msg):
+    self.output_panel.Print(msg)
 
 
 class ChromiumBuildCommand(sublime_plugin.WindowCommand):
