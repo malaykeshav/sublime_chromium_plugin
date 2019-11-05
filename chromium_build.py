@@ -1,3 +1,6 @@
+import sublime
+import sublime_plugin
+
 import select
 import subprocess
 import time
@@ -77,20 +80,27 @@ DEFAULT_OS_TARGETS = [
 ]
 
 GN_ARGS_FILE_NAME = "args.gn"
+COMMAND_LINE_FLAGS_FILE_NAME = "command_line_flags.txt"
+CHROME_OUTPUT_FILE_NAME = "chrome_output.txt"
 
 # Bash command line interface for this plugin.
 BASH_INTERFACE = None
 
 LINE_REGEX = r'(?:^|[)] )[.\\\\/]*([a-z]?:?[\\w.\\\\/]+)[(:]([0-9]+)[,:]?([0-9]+)?[)]?:?(.*)$'
 
+# Token identifier to identify the end of a output/input stream.
 STREAM_END_TOKEN = 'SUBLIME_STREAM_END'
 
 # Settings key:
 GN_ARGS_FILE_KEY = 'GN_ARGS_FILE_KEY'
 GN_ARGS_OUT_DIR_KEY = 'GN_ARGS_OUT_DIR_KEY'
+GN_ARGS_SOURCE_FILE_KEY = 'GN_ARGS_SOURCE_FILE_KEY'
 
 # Popen object for the current build process.
 BUILD_PROCESS = None
+
+# Popen object for the current executing chrome binary
+CHROME_PROCESS = None
 
 class BashInterface:
   output_panel = None
@@ -125,11 +135,11 @@ class BashInterface:
   def __StreamResult(self, file=None, timeout=0.5, end_token=None):
     if file:
       threading.Thread(
-          target=self.__StreamFileContent,
+          target=self.__StreamFileContent, name="StreamFileContent",
           args=(file, self.output_panel, end_token)).start()
     else:
       threading.Thread(
-          target=self.__StreamResultTarget,
+          target=self.__StreamResultTarget, name="StreamStdOutContent",
           args=(self.BASH.stdout, timeout, self.output_panel)).start()
 
 
@@ -159,11 +169,9 @@ class BashInterface:
       current_line = ""
       while end_token not in current_line:
         current_line = file.readline()
-        if len(current_line) > 0:
-          if output_panel:
-            output_panel.Print(current_line.rstrip())
-          else:
-            print (current_line)
+        if len(current_line) > 0 and end_token not in current_line:
+          output_panel.Print(current_line.rstrip())
+      output_panel.Print('End out Output Stream')
 
 
   def __RunCmdAndGetResult(self, cmd):
@@ -188,6 +196,9 @@ class BashInterface:
   def CreateDirectory(self, path):
     self.__RunCmd("mkdir -p " + path)
 
+  def CopyFileContents(self, source, target):
+    self.__RunCmd("cat " + source + " > " + target + "\n")
+
   def GenerateGnArgs(self, path):
     print ("Will run: " + "gn gen \'" + path + "\'\n")
     self.__RunCmd("gn gen \'" + path + "\'\n")
@@ -201,50 +212,93 @@ class BashInterface:
   def SetOutputPanel(self, output_panel):
     self.output_panel = output_panel
 
-  def TerminateBuild(self):
-    global BUILD_PROCESS
+  def GetCommandLineFlags(self, path):
+    flags = []
+    print ("Opening flags file: " + path)
+    with open(path, 'r') as file:
+      for current_line in file:
+        if current_line[0] == '#' or len(current_line.rstrip()) == 0:
+          continue
+        flags.append(current_line.rstrip())
+        current_line = file.readline()
+    return flags
 
-    if not BUILD_PROCESS:
+  def TerminateProcess(process):
+    if not process:
       return
 
-    # Stop any previous build process if they are still running.
-    if BUILD_PROCESS.poll():
-      BUILD_PROCESS.terminate()
+    if process.poll():
+      process.terminate()    
 
   def Build(self, build_settings):
     build_output_filename = "/build_output.txt"
     build_output_file_path = build_settings.build_dir + build_output_filename
 
+    global BUILD_PROCESS
+
+    # Stop any previous build process if they are still running.
+    BashInterface.TerminateProcess(BUILD_PROCESS)
+
+    # Inform the thread to stop reading the output
+    # self.__RunCmd("echo \'\nSTREAM_END_TOKEN\' >> " + build_output_file_path)
+
+
     # Reset the output file and start reading from it.
     self.CreateFile(build_output_file_path)
-    self.__StreamResult(file=build_output_file_path, timeout=30, 
-                        end_token=STREAM_END_TOKEN)
+    self.__StreamResult(file=build_output_file_path, end_token=STREAM_END_TOKEN)
 
     target_str = " ".join(build_settings.targets)
 
-    cmd =  ['cd', build_settings.project_path, ';']
-    cmd += ['ninja', '-j4096', '-C', build_settings.build_dir, target_str]
+    cmd =  ['cd', build_settings.project_src_path, ';']
+    cmd += ['ninja', '-j1024', '-C', build_settings.build_dir, target_str]
     cmd += ['>', build_output_file_path]
     cmd += [';', 'echo', STREAM_END_TOKEN, '>>', build_output_file_path]
     build_cmd = " ".join(cmd)
 
-    global BUILD_PROCESS
-
-    self.TerminateBuild()
 
     # Execute the command to build on a separate process that logs output into a file.
     BUILD_PROCESS = subprocess.Popen(build_cmd, shell=True)
 
     self.output_panel.Print("Build Process ID: " + str(BUILD_PROCESS.pid))
 
+  def Run(self, build_settings):
+    target_binary = build_settings.build_dir + "./chrome"
+    chrome_output_file_path = build_settings.build_dir + CHROME_OUTPUT_FILE_NAME
+    command_line_flags_path = (build_settings.project_path + "/" + 
+                              COMMAND_LINE_FLAGS_FILE_NAME)
+    
+    flags = self.GetCommandLineFlags(command_line_flags_path)
+
+    # Reset the output file and start reading from it.
+    self.CreateFile(chrome_output_file_path)
+    self.__StreamResult(file=chrome_output_file_path, end_token=STREAM_END_TOKEN)
+
+    global CHROME_PROCESS
+    # Terminate any previously running chrome binary execution
+    BashInterface.TerminateProcess(CHROME_PROCESS)
+    
+    cmd = []
+    cmd += ['cd', build_settings.build_dir, ';']
+    cmd += [target_binary]
+    cmd += flags
+    cmd += ['&>', chrome_output_file_path]
+    cmd += [';', 'echo', STREAM_END_TOKEN, '>>', chrome_output_file_path]
+
+    self.output_panel.Print(" ".join(cmd))
+    CHROME_PROCESS =  subprocess.Popen(" ".join(cmd), shell=True)
+    self.output_panel.Print("Chrome Process ID: " + str(CHROME_PROCESS.pid))
+
+
 class BuildSettings:
+  project_src_path = None
   project_path = None
   platform_str = None
   build_dir = None
   targets = []
 
   def __init__(self, window, args):
-    self.project_path = window.extract_variables()['folder']
+    self.project_src_path = window.extract_variables()['folder']
+    self.project_path = window.extract_variables()['project_path']
 
     if "device" not in args:
       args["device"] = ""
@@ -252,7 +306,7 @@ class BuildSettings:
     platform = args['platform']
 
     self.platform_str = ['android', 'cros', args["device"], 'linux'][platform]
-    self.build_dir = (self.project_path + '/out_' +
+    self.build_dir = (self.project_src_path + '/out_' +
                      self.platform_str + '/Default/')
 
     self.targets = []
@@ -261,7 +315,7 @@ class BuildSettings:
 
   def __eq__(self, obj):
     return (isinstance(obj, BuildSettings) and
-            self.project_path == obj.project_path and
+            self.project_src_path == obj.project_src_path and
             self.platform_str == obj.platform_str and
             self.build_dir == obj.build_dir)
 
@@ -302,7 +356,6 @@ class DeviceInputHandler(sublime_plugin.TextInputHandler):
     return ""
 
 
-class OperationOptionInputHandler(sublime_plugin.ListInputHandler):
   OPERATION_LIST = [
     ("Generate GN Args", Operation.GENERATE_GN_ARGS),
     ("Build", Operation.BUILD),
@@ -398,12 +451,14 @@ class GnArgViewListener(sublime_plugin.ViewEventListener):
     if self.out_dir is None:
       print ("Out director was NONE!")
       return
-    print ("Path exists: " + self.out_dir)
     if not os.path.exists(self.out_dir):
+      print ("Path did not exist: " + self.out_dir)
       BashInterface.Get().CreateDirectory(self.out_dir)
-    print ("Path exists: " + self.out_dir + GN_ARGS_FILE_NAME)
-    if not os.path.exists(self.out_dir + GN_ARGS_FILE_NAME):
-      BashInterface.Get().MaybeCreateFile(self.out_dir, GN_ARGS_FILE_NAME)
+    else:
+      print ("Path exists: " + self.out_dir)
+
+    target_gn_file = self.out_dir + GN_ARGS_FILE_NAME
+    BashInterface.Get().CopyFileContents(self.view.file_name(), target_gn_file)
 
     BashInterface.Get().GenerateGnArgs(self.out_dir)
 
@@ -420,8 +475,8 @@ class ChromiumCommand(sublime_plugin.WindowCommand):
     super(ChromiumCommand, self).__init__(*args)
 
     # Ensure we are in the correct project directory
-    project_path = self.window.extract_variables()['folder']
-    BashInterface.Get().GoToDirectory(project_path)
+    project_src_path = self.window.extract_variables()['folder']
+    BashInterface.Get().GoToDirectory(project_src_path)
 
   def is_enabled(self):
     return True
@@ -471,11 +526,11 @@ class ChromiumCommand(sublime_plugin.WindowCommand):
     return PlatformOptionInputHandler()
 
   def GenerateGnArgs(self, build_settings):
-    self.Print("Generating GN Args")
-    self.Print("Project path: " + build_settings.project_path)
-    self.Print("out directory: " + build_settings.build_dir)
+    self.output_panel.Print("Generating GN Args")
+    self.output_panel.Print("Project path: " + build_settings.project_src_path)
+    self.output_panel.Print("out directory: " + build_settings.build_dir)
 
-    source_gn_dir = build_settings.project_path + "/../"
+    source_gn_dir = build_settings.project_path + "/"
     source_gn_file = build_settings.platform_str + '.gn'
 
     BashInterface.Get().MaybeCreateFile(source_gn_dir, source_gn_file)
@@ -484,22 +539,13 @@ class ChromiumCommand(sublime_plugin.WindowCommand):
          source_gn_dir + source_gn_file, sublime.TRANSIENT)
     gn_view.settings().set(GN_ARGS_FILE_KEY, True)
     gn_view.settings().set(GN_ARGS_OUT_DIR_KEY, build_settings.build_dir)
+    gn_view.settings().set(GN_ARGS_SOURCE_FILE_KEY, source_gn_file)
 
   def Build(self, build_settings):
-    self.Print("Build chrome for " + build_settings.platform_str)
-    self.Print("Targets: " + (",".join(build_settings.targets)))
+    self.output_panel.Print("Build chrome for " + build_settings.platform_str)
+    self.output_panel.Print("Targets: " + (",".join(build_settings.targets)))
     BashInterface.Get().Build(build_settings)
 
   def Run(self, build_settings):
-    self.Print("Executing chrome for " + build_settings.platform_str)
-
-  def Print(self, msg):
-    self.output_panel.Print(msg)
-
-
-class ChromiumBuildCommand(sublime_plugin.WindowCommand):
-  def is_enabled(self):
-    return True
-
-  def run(self):
-    return
+    self.output_panel.Print("Executing chrome for " + build_settings.platform_str)
+    BashInterface.Get().Run(build_settings)
